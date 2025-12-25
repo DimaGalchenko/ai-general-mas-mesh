@@ -1,4 +1,6 @@
+import asyncio
 import os
+import sys
 
 import uvicorn
 from aidial_sdk import DIALApp
@@ -25,3 +27,62 @@ _DDG_MCP_URL = os.getenv('DDG_MCP_URL', "http://localhost:8051/mcp")
 # 4. Create DIALApp with deployment_name `web-search-agent` (the same as in the core config) and impl is instance
 #    of the WebSearchApplication
 # 5. Add starter with DIALApp, port is 5003 (see core config)
+
+class WebSearchApplication(ChatCompletion):
+
+    def __init__(self):
+        self.tools: list[BaseTool] = []
+
+    async def _get_mcp_tools(self, url: str) -> list[BaseTool]:
+        try:
+            tools: list[BaseTool] = []
+            mcp_client = await MCPClient.create(url)
+            for mcp_tool_model in await mcp_client.get_tools():
+                tools.append(
+                    MCPTool(
+                        client=mcp_client,
+                        mcp_tool_model=mcp_tool_model,
+                    )
+                )
+            return tools
+        except Exception as e:
+            print(f"Warning: Could not load MCP tools: {e}")
+            raise e
+
+    async def _create_tools(self) -> list[BaseTool]:
+        tools: list[BaseTool] = [
+            CalculationsAgentTool(DIAL_ENDPOINT),
+            ContentManagementAgentTool(DIAL_ENDPOINT),
+        ]
+        tools.extend(await self._get_mcp_tools(_DDG_MCP_URL))
+        return tools
+
+    async def chat_completion(self, request: Request, response: Response) -> None:
+        if not self.tools:
+            self.tools = await self._create_tools()
+
+        with response.create_single_choice() as choice:
+            await WebSearchAgent(
+                endpoint=DIAL_ENDPOINT,
+                tools=self.tools
+            ).handle_request(
+                choice=choice,
+                deployment_name=DEPLOYMENT_NAME,
+                request=request,
+                response=response,
+            )
+
+
+app: DIALApp = DIALApp()
+agent_app = WebSearchApplication()
+app.add_chat_completion(deployment_name="web-search-agent", impl=agent_app)
+
+
+if __name__ == "__main__":
+
+    if 'pydevd' in sys.modules:
+        config = uvicorn.Config(app, port=5003, host="0.0.0.0", log_level="info")
+        server = uvicorn.Server(config)
+        asyncio.run(server.serve())
+    else:
+        uvicorn.run(app, port=5003, host="0.0.0.0", log_level="info")
